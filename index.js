@@ -4,6 +4,9 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
+require('dotenv').config();
+const path = require('path');
+
 // Constants for conversation states
 const STATES = {
   MAIN_MENU: 'MAIN_MENU',
@@ -20,7 +23,7 @@ const STATES = {
 
 // Bot configuration with multiple Sepolia RPC endpoints for fallback
 const config = {
-  TELEGRAM_TOKEN: '7625273574:AAGPByqO1_K2okV1yvCm9wdXo1rgJ7tLLX0',
+  TELEGRAM_TOKEN: process.env.TELEGRAM_TOKEN,
   DATA_FILE: path.join(__dirname, 'user_data.json'),
   NETWORK: 'sepolia',
   RPC_ENDPOINTS: [
