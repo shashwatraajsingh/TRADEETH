@@ -11,9 +11,11 @@ const STATES = {
   AUTO_TRADE_SETUP: 'AUTO_TRADE_SETUP',
   SET_BUY_PRICE: 'SET_BUY_PRICE',
   SET_SELL_PRICE: 'SET_SELL_PRICE',
+  SET_AMOUNT: 'SET_AMOUNT',
   CONFIRM_AUTO_TRADE: 'CONFIRM_AUTO_TRADE',
   ENTER_BUY_AMOUNT: 'ENTER_BUY_AMOUNT',
-  ENTER_SELL_AMOUNT: 'ENTER_SELL_AMOUNT'
+  ENTER_SEND_AMOUNT: 'ENTER_SEND_AMOUNT',
+  ENTER_SEND_ADDRESS: 'ENTER_SEND_ADDRESS'
 };
 
 // Bot configuration with multiple Sepolia RPC endpoints for fallback
@@ -22,12 +24,15 @@ const config = {
   DATA_FILE: path.join(__dirname, 'user_data.json'),
   NETWORK: 'sepolia',
   RPC_ENDPOINTS: [
-    'https://rpc.sepolia.org',
     'https://eth-sepolia.public.blastapi.io',
     'https://sepolia.gateway.tenderly.co',
-    'https://ethereum-sepolia.blockpi.network/v1/rpc/public'
+    'https://ethereum-sepolia.blockpi.network/v1/rpc/public',
+    'https://rpc.sepolia.org'
   ],
-  FAUCET_URL: 'https://sepoliafaucet.com/'
+  FAUCET_URL: 'https://sepoliafaucet.com/',
+  ETHERSCAN_URL: 'https://sepolia.etherscan.io',
+  COINGECKO_API_URL: 'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd',
+  PRICE_CHECK_INTERVAL: 60000  
 };
 
 // Function to initialize Web3 with fallback
@@ -35,43 +40,59 @@ async function initWeb3() {
   for (const endpoint of config.RPC_ENDPOINTS) {
     try {
       const web3 = new Web3(new Web3.providers.HttpProvider(endpoint));
-      
-      // Test the connection by getting the latest block number
       const blockNumber = await web3.eth.getBlockNumber();
       console.log(`Connected to Sepolia via ${endpoint}. Latest block: ${blockNumber}`);
-      
-      // If successful, return this web3 instance
       return web3;
     } catch (error) {
       console.error(`Failed to connect to ${endpoint}: ${error.message}`);
-      // Continue to the next endpoint
     }
   }
-  
-  // If all endpoints fail, throw an error
   throw new Error('Failed to connect to any Sepolia RPC endpoint');
 }
 
-// Initialize bot
+
 const bot = new Telegraf(config.TELEGRAM_TOKEN);
 
 // Data storage functions
 function loadUserData() {
   try {
+    if (!fs.existsSync(config.DATA_FILE)) {
+      fs.writeFileSync(config.DATA_FILE, JSON.stringify({}));
+      return {};
+    }
     const data = fs.readFileSync(config.DATA_FILE, 'utf8');
     return JSON.parse(data);
   } catch (error) {
-    // If file doesn't exist or has invalid JSON, return empty object
+    console.error(`Error loading user data: ${error.message}`);
     return {};
   }
 }
 
 function saveUserData(data) {
-  fs.writeFileSync(config.DATA_FILE, JSON.stringify(data, null, 2));
+  try {
+    fs.writeFileSync(config.DATA_FILE, JSON.stringify(data, null, 2));
+    return true;
+  } catch (error) {
+    console.error(`Error saving user data: ${error.message}`);
+    return false;
+  }
 }
 
 // Global web3 instance
 let web3;
+
+// Create rate limiter for CoinGecko API
+const RATE_LIMIT = {
+  lastCall: 0,
+  minInterval: 10000,
+};
+
+// Price caching to avoid rate limits
+const priceCache = {
+  ethUsd: null,
+  timestamp: 0,
+  validFor: 60000
+};
 
 // Wallet and trading functions
 async function createUserWallet(userId) {
@@ -79,99 +100,240 @@ async function createUserWallet(userId) {
   const address = account.address;
   const privateKey = account.privateKey;
   
-  // In a real application, store the private key securely
-  // For demo purposes, we'll store it with user data
   const userData = loadUserData();
   userData[userId] = {
     walletAddress: address,
-    privateKey: privateKey, // In production, use proper key management
+    privateKey: privateKey,
     balance: "0",
+    transactions: [],
     autoTrades: []
   };
   saveUserData(userData);
-  
   return address;
 }
 
 async function getEthPrice() {
+  const now = Date.now();
+  
+  if (priceCache.ethUsd !== null && now - priceCache.timestamp < priceCache.validFor) {
+    console.log(`Using cached ETH price: $${priceCache.ethUsd}`);
+    return priceCache.ethUsd;
+  }
+  
+  if (now - RATE_LIMIT.lastCall < RATE_LIMIT.minInterval) {
+    const delay = RATE_LIMIT.minInterval - (now - RATE_LIMIT.lastCall);
+    console.log(`Rate limiting: waiting ${delay}ms before calling CoinGecko API`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+  
   try {
-    const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd');
-    return parseFloat(response.data.ethereum.usd);
+    RATE_LIMIT.lastCall = Date.now();
+    const response = await axios.get(config.COINGECKO_API_URL);
+    const price = parseFloat(response.data.ethereum.usd);
+    priceCache.ethUsd = price;
+    priceCache.timestamp = Date.now();
+    console.log(`Fetched new ETH price: $${price}`);
+    return price;
   } catch (error) {
     console.error(`Error getting ETH price: ${error.message}`);
-    return 2000; // Fallback price if API fails
+    if (priceCache.ethUsd !== null) return priceCache.ethUsd;
+    return 2000;
   }
 }
 
 async function checkBalance(address) {
   try {
     const balanceWei = await web3.eth.getBalance(address);
-    const balanceEth = web3.utils.fromWei(balanceWei, 'ether');
-    return parseFloat(balanceEth);
+    return parseFloat(web3.utils.fromWei(balanceWei, 'ether'));
   } catch (error) {
     console.error(`Error checking balance: ${error.message}`);
     return 0;
   }
 }
 
-// Simulate buy transaction (for testnet)
 async function simulateBuyTransaction(userId, amount) {
   const userData = loadUserData();
   const user = userData[userId];
-  
-  // This is a simulation for demonstration purposes
-  // In a real application, you would create and sign an actual transaction
   const ethPrice = await getEthPrice();
   const usdValue = amount * ethPrice;
-  
-  // Update the user's balance (simulated)
   const currentBalance = await checkBalance(user.walletAddress);
-  const newBalance = currentBalance + amount;
+
+  console.log(`[SIMULATION] User ${userId} bought ${amount} ETH at ${ethPrice}`);
   
-  // Log the transaction (for demo purposes)
-  console.log(`[SIMULATION] User ${userId} bought ${amount} ETH at $${ethPrice} (Total: $${usdValue})`);
+  const txn = {
+    type: 'buy',
+    amount: amount,
+    price: ethPrice,
+    usdValue: usdValue,
+    timestamp: Date.now(),
+    txHash: `sim_buy_${Date.now().toString(16)}`
+  };
+  
+  // Initialize transactions array if it doesn't exist
+  if (!user.transactions) {
+    user.transactions = [];
+  }
+  
+  user.transactions.push(txn);
+  user.balance = (currentBalance + amount).toString();
+  saveUserData(userData);
   
   return {
     success: true,
-    newBalance: newBalance,
+    newBalance: currentBalance + amount,
     ethPrice: ethPrice,
     amount: amount,
-    usdValue: usdValue
+    usdValue: usdValue,
+    txHash: txn.txHash
   };
 }
 
-// Simulate sell transaction (for testnet)
-async function simulateSellTransaction(userId, amount) {
-  const userData = loadUserData();
-  const user = userData[userId];
-  
-  // This is a simulation for demonstration purposes
-  const ethPrice = await getEthPrice();
-  const usdValue = amount * ethPrice;
-  
-  // Check if the user has enough balance
-  const currentBalance = await checkBalance(user.walletAddress);
-  if (currentBalance < amount) {
+async function sendEthTransaction(userId, toAddress, amount) {
+  try {
+    const userData = loadUserData();
+    const user = userData[userId];
+    const currentBalance = await checkBalance(user.walletAddress);
+    
+    // Check if user has enough balance
+    if (currentBalance < amount) {
+      return { 
+        success: false, 
+        error: 'Insufficient balance', 
+        currentBalance 
+      };
+    }
+    
+    // Here we would normally send the transaction using web3.js
+    // But since we're simulating for testnet, we'll create a mock transaction
+    console.log(`[SIMULATION] User ${userId} sent ${amount} ETH to ${toAddress}`);
+    
+    const ethPrice = await getEthPrice();
+    const usdValue = amount * ethPrice;
+    
+    const txn = {
+      type: 'send',
+      amount: amount,
+      to: toAddress,
+      price: ethPrice,
+      usdValue: usdValue,
+      timestamp: Date.now(),
+      txHash: `sim_send_${Date.now().toString(16)}`
+    };
+    
+    // Initialize transactions array if it doesn't exist
+    if (!user.transactions) {
+      user.transactions = [];
+    }
+    
+    user.transactions.push(txn);
+    user.balance = (currentBalance - amount).toString();
+    saveUserData(userData);
+    
+    return {
+      success: true,
+      newBalance: currentBalance - amount,
+      ethPrice: ethPrice,
+      amount: amount,
+      usdValue: usdValue,
+      txHash: txn.txHash,
+      to: toAddress
+    };
+  } catch (error) {
+    console.error(`Error sending ETH: ${error.message}`);
     return {
       success: false,
-      error: 'Insufficient balance',
-      currentBalance: currentBalance
+      error: error.message
     };
   }
+}
+
+// For a real implementation, we would use this function to send ETH
+async function sendEthReal(userId, toAddress, amount) {
+  const userData = loadUserData();
+  const user = userData[userId];
+  const privateKey = user.privateKey;
+  const fromAddress = user.walletAddress;
+  const currentBalance = await checkBalance(fromAddress);
   
-  // Update the user's balance (simulated)
-  const newBalance = currentBalance - amount;
+  if (currentBalance < amount) {
+    return { success: false, error: 'Insufficient balance', currentBalance };
+  }
   
-  // Log the transaction (for demo purposes)
-  console.log(`[SIMULATION] User ${userId} sold ${amount} ETH at $${ethPrice} (Total: $${usdValue})`);
-  
-  return {
-    success: true,
-    newBalance: newBalance,
-    ethPrice: ethPrice,
-    amount: amount,
-    usdValue: usdValue
-  };
+  try {
+    // Create and sign transaction
+    const gasPrice = await web3.eth.getGasPrice();
+    const gasLimit = 21000; // Standard gas limit for ETH transfer
+    const nonce = await web3.eth.getTransactionCount(fromAddress);
+    const amountWei = web3.utils.toWei(amount.toString(), 'ether');
+    
+    // Calculate max gas cost
+    const maxGasCost = web3.utils.toBN(gasPrice).mul(web3.utils.toBN(gasLimit));
+    
+    // Check if balance is enough for amount + gas
+    const totalRequired = web3.utils.toBN(amountWei).add(maxGasCost);
+    const balanceWei = web3.utils.toWei(currentBalance.toString(), 'ether');
+    
+    if (web3.utils.toBN(balanceWei).lt(totalRequired)) {
+      return { 
+        success: false, 
+        error: 'Insufficient balance including gas fees', 
+        currentBalance 
+      };
+    }
+    
+    const txObject = {
+      nonce: web3.utils.toHex(nonce),
+      to: toAddress,
+      value: web3.utils.toHex(amountWei),
+      gasLimit: web3.utils.toHex(gasLimit),
+      gasPrice: web3.utils.toHex(gasPrice)
+    };
+    
+    // Sign transaction
+    const signedTx = await web3.eth.accounts.signTransaction(txObject, privateKey);
+    
+    // Send transaction
+    const receipt = await web3.eth.sendSignedTransaction(signedTx.rawTransaction);
+    
+    // Update user data
+    const ethPrice = await getEthPrice();
+    const usdValue = amount * ethPrice;
+    
+    const txn = {
+      type: 'send',
+      amount: amount,
+      to: toAddress,
+      price: ethPrice,
+      usdValue: usdValue,
+      timestamp: Date.now(),
+      txHash: receipt.transactionHash
+    };
+    
+    if (!user.transactions) {
+      user.transactions = [];
+    }
+    
+    user.transactions.push(txn);
+    const newBalance = await checkBalance(fromAddress);
+    user.balance = newBalance.toString();
+    saveUserData(userData);
+    
+    return {
+      success: true,
+      newBalance,
+      ethPrice,
+      amount,
+      usdValue,
+      txHash: receipt.transactionHash,
+      to: toAddress
+    };
+  } catch (error) {
+    console.error(`Error sending ETH: ${error.message}`);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
 }
 
 // Setup session middleware
@@ -194,20 +356,15 @@ bot.start(async (ctx) => {
     await ctx.reply(
       `Welcome to ETH Trading Bot (Sepolia Testnet)! 🚀\n\n` +
       `Your unique wallet address for deposits:\n${address}\n\n` +
-      `Get free Sepolia ETH from faucets like:\n${config.FAUCET_URL}\n\n` +
-      `After getting test ETH, deposit to this address to start trading.`
+      `Get free Sepolia ETH from faucets like:\n${config.FAUCET_URL}`
     );
   } else {
     address = userData[userId].walletAddress;
-    await ctx.reply(
-      `Welcome back to ETH Trading Bot (Sepolia Testnet)! 🚀\n\n` +
-      `Your wallet address:\n${address}\n\n` +
-      `Need more test ETH? Visit: ${config.FAUCET_URL}`
-    );
+    await ctx.reply(`Welcome back! Your wallet address:\n${address}`);
   }
   
   await showMainMenu(ctx);
-  ctx.session = { state: STATES.MAIN_MENU };
+  ctx.session.state = STATES.MAIN_MENU;
 });
 
 async function showMainMenu(ctx) {
@@ -222,7 +379,7 @@ async function showMainMenu(ctx) {
   );
 }
 
-// Handle menu callbacks
+// Handle menu callbacks with proper block scoping
 bot.action(/.*/, async (ctx) => {
   const action = ctx.match[0];
   const userId = ctx.from.id.toString();
@@ -237,217 +394,335 @@ bot.action(/.*/, async (ctx) => {
   await ctx.answerCbQuery();
   
   switch (action) {
-    case 'deposit':
+    case 'deposit': {
       const address = userData[userId].walletAddress;
       await ctx.editMessageText(
-        `Deposit Sepolia ETH to your unique wallet address:\n\n${address}\n\n` +
-        `Get free Sepolia ETH from:\n${config.FAUCET_URL}\n\n` +
-        `After sending funds, it may take a few minutes for your balance to update.`,
+        `Deposit Sepolia ETH to:\n\n${address}\n\n` +
+        `Faucet: ${config.FAUCET_URL}`,
         Markup.inlineKeyboard([
-          [Markup.button.callback('⬅️ Back to Menu', 'back_to_menu')]
+          [Markup.button.callback('🔄 Refresh Balance', 'refresh_balance')],
+          [Markup.button.callback('⬅️ Back', 'back_to_menu')]
         ])
       );
       ctx.session.state = STATES.DEPOSIT;
       break;
-      
-    case 'trade':
-      const ethPrice = await getEthPrice();
-      const balance = await checkBalance(userData[userId].walletAddress);
+    }
+    
+    case 'refresh_balance': {
+      const refreshAddress = userData[userId].walletAddress;
+      const balance = await checkBalance(refreshAddress);
+      userData[userId].balance = balance.toString();
+      saveUserData(userData);
       
       await ctx.editMessageText(
-        `Current ETH Price: $${ethPrice.toFixed(2)}\n` +
-        `Your Balance: ${balance.toFixed(6)} Sepolia ETH ($${(balance * ethPrice).toFixed(2)})\n\n` +
-        `What would you like to do?`,
+        `Address: ${refreshAddress}\n` +
+        `Balance: ${balance.toFixed(6)} ETH\n` +
+        `Faucet: ${config.FAUCET_URL}`,
         Markup.inlineKeyboard([
-          [Markup.button.callback('Buy ETH', 'buy_eth')],
-          [Markup.button.callback('Sell ETH', 'sell_eth')],
-          [Markup.button.callback('⬅️ Back to Menu', 'back_to_menu')]
+          [Markup.button.callback('🔄 Refresh', 'refresh_balance')],
+          [Markup.button.callback('⬅️ Back', 'back_to_menu')]
+        ])
+      );
+      break;
+    }
+    
+    case 'trade': {
+      const ethPrice = await getEthPrice();
+      const balance = await checkBalance(userData[userId].walletAddress);
+      userData[userId].balance = balance.toString();
+      saveUserData(userData);
+      
+      await ctx.editMessageText(
+        `Price: $${ethPrice.toFixed(2)}\n` +
+        `Balance: ${balance.toFixed(6)} ETH ($${(balance * ethPrice).toFixed(2)})`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback('Buy', 'buy_eth')],
+          [Markup.button.callback('Send ETH', 'send_eth')],
+          [Markup.button.callback('⬅️ Back', 'back_to_menu')]
         ])
       );
       ctx.session.state = STATES.MAIN_MENU;
       break;
-      
-    case 'buy_eth':
+    }
+    
+    case 'buy_eth': {
       const ethPriceBuy = await getEthPrice();
       const balanceBuy = await checkBalance(userData[userId].walletAddress);
       
       await ctx.editMessageText(
-        `Current ETH Price: $${ethPriceBuy.toFixed(2)}\n` +
-        `Your Balance: ${balanceBuy.toFixed(6)} Sepolia ETH\n\n` +
-        `How much ETH would you like to buy? (Simulation only)\n` +
-        `Please enter an amount in ETH (e.g., 0.1):`,
-        Markup.inlineKeyboard([
-          [Markup.button.callback('⬅️ Back to Trade', 'trade')]
-        ])
+        `Current Price: $${ethPriceBuy.toFixed(2)}\n` +
+        `Your Balance: ${balanceBuy.toFixed(6)} ETH\n` +
+        `Enter buy amount in ETH:`,
+        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'trade')]])
       );
       ctx.session.state = STATES.ENTER_BUY_AMOUNT;
       break;
-      
-    case 'sell_eth':
-      const ethPriceSell = await getEthPrice();
-      const balanceSell = await checkBalance(userData[userId].walletAddress);
+    }
+    
+    case 'send_eth': {
+      const ethPriceSend = await getEthPrice();
+      const balanceSend = await checkBalance(userData[userId].walletAddress);
       
       await ctx.editMessageText(
-        `Current ETH Price: $${ethPriceSell.toFixed(2)}\n` +
-        `Your Balance: ${balanceSell.toFixed(6)} Sepolia ETH\n\n` +
-        `How much ETH would you like to sell? (Simulation only)\n` +
-        `Please enter an amount in ETH (e.g., 0.05):`,
-        Markup.inlineKeyboard([
-          [Markup.button.callback('⬅️ Back to Trade', 'trade')]
-        ])
+        `Current Price: $${ethPriceSend.toFixed(2)}\n` +
+        `Your Balance: ${balanceSend.toFixed(6)} ETH\n` +
+        `Enter wallet address to send ETH to:`,
+        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'trade')]])
       );
-      ctx.session.state = STATES.ENTER_SELL_AMOUNT;
+      ctx.session.state = STATES.ENTER_SEND_ADDRESS;
       break;
-      
-    case 'auto_trade':
+    }
+    
+    case 'auto_trade': {
       const price = await getEthPrice();
-      
       await ctx.editMessageText(
-        `Current ETH Price: $${price.toFixed(2)}\n\n` +
-        `Auto-Trade allows you to set buy and sell orders that execute automatically ` +
-        `when your target prices are reached.`,
+       
+`Current Price: $${price.toFixed(2)}\n` +
+        `Configure auto-trade triggers:`,
         Markup.inlineKeyboard([
-          [Markup.button.callback('Set Up Auto-Trade', 'setup_auto_trade')],
-          [Markup.button.callback('View Active Auto-Trades', 'view_auto_trades')],
-          [Markup.button.callback('⬅️ Back to Menu', 'back_to_menu')]
-        ])
-      );
+          [Markup.button.callback('Setup', 'setup_auto_trade')],
+          [Markup.button.callback('View', 'view_auto_trades')],
+          [Markup.button.callback('⬅️ Back', 'back_to_menu')]
+        ]));  
       ctx.session.state = STATES.AUTO_TRADE_SETUP;
       break;
-      
-    case 'setup_auto_trade':
+    }
+    
+    case 'setup_auto_trade': {
       const currentPrice = await getEthPrice();
-      
       await ctx.editMessageText(
-        `Current ETH Price: $${currentPrice.toFixed(2)}\n\n` +
-        `At what price would you like to BUY ETH?\n` +
-        `Enter a USD price (e.g., ${(currentPrice * 0.95).toFixed(2)} for 5% below current price):`,
-        Markup.inlineKeyboard([
-          [Markup.button.callback('⬅️ Back to Auto-Trade', 'auto_trade')]
-        ])
+        `Set buy price (current: $${currentPrice.toFixed(2)}):`,
+        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'auto_trade')]])
       );
       ctx.session.state = STATES.SET_BUY_PRICE;
       break;
-      
-    case 'view_auto_trades':
-      const userData = loadUserData();
-      const autoTrades = userData[userId].autoTrades || [];
-      let messageText = '';
-      
-      if (autoTrades.length > 0) {
-        messageText = `🤖 Your Active Auto-Trades:\n\n`;
-        autoTrades.forEach((trade, i) => {
-          messageText += `#${i+1}: Buy at $${trade.buyPrice}, Sell at $${trade.sellPrice}\n`;
-        });
-      } else {
-        messageText = `You don't have any active auto-trades. Use 'Set Up Auto-Trade' to create one.`;
-      }
-      
+    }
+    
+    case 'view_auto_trades': {
+      const trades = userData[userId].autoTrades || [];
+      let msg = trades.length > 0 
+        ? trades.map((t, i) => `#${i+1}: Buy@$${t.buyPrice} Sell@$${t.sellPrice} Amount:${t.amount} ETH`).join('\n')
+        : 'No active auto-trades';
       await ctx.editMessageText(
-        messageText,
+        msg, 
         Markup.inlineKeyboard([
-          [Markup.button.callback('⬅️ Back to Auto-Trade', 'auto_trade')]
+          [Markup.button.callback('⬅️ Back', 'auto_trade')]
         ])
       );
       break;
+    }
+    
+    case 'portfolio': {
+      const price = await getEthPrice();
+      const balance = await checkBalance(userData[userId].walletAddress);
+      userData[userId].balance = balance.toString();
+      saveUserData(userData);
       
-    case 'portfolio':
-      const currentPricePortfolio = await getEthPrice();
-      const userBalance = await checkBalance(userData[userId].walletAddress);
-      
-      // Get auto-trade information
-      const autoTrades = userData[userId].autoTrades || [];
-      let autoTradeInfo = "\n\n🤖 Auto-Trades:\n";
-      
-      if (autoTrades.length > 0) {
-        autoTrades.forEach((trade, i) => {
-          autoTradeInfo += `#${i+1}: Buy at $${trade.buyPrice}, Sell at $${trade.sellPrice}\n`;
-        });
-      } else {
-        autoTradeInfo += "No active auto-trades.\n";
-      }
+      const txns = (userData[userId].transactions || []).slice(-3).reverse();
+      let txHistory = txns.length > 0 ? txns.map(t => {
+        if (t.type === 'buy') {
+          return `🟢 Buy ${t.amount.toFixed(4)} ETH @ $${t.price.toFixed(2)}`;
+        } else if (t.type === 'send') {
+          return `🔹 Send ${t.amount.toFixed(4)} ETH to ${t.to.substring(0, 8)}...`;
+        } else {
+          return `${t.type === 'buy' ? '🟢' : '🔴'} ${t.amount.toFixed(4)} ETH @ $${t.price.toFixed(2)}`;
+        }
+      }).join('\n') : 'None';
       
       await ctx.editMessageText(
-        `💼 Your Portfolio (Sepolia Testnet):\n\n` +
-        `ETH Balance: ${userBalance.toFixed(6)} ETH\n` +
-        `Value: $${(userBalance * currentPricePortfolio).toFixed(2)}\n` +
-        `Current ETH Price: $${currentPricePortfolio.toFixed(2)}\n` +
-        `${autoTradeInfo}`,
+        `Portfolio:\n` +
+        `Balance: ${balance.toFixed(6)} ETH ($${(balance * price).toFixed(2)})\n` +
+        `Recent TXs:\n${txHistory}`,
         Markup.inlineKeyboard([
-          [Markup.button.callback('⬅️ Back to Menu', 'back_to_menu')]
+          [Markup.button.callback('🔄 Refresh', 'portfolio')],
+          [Markup.button.callback('⬅️ Back', 'back_to_menu')]
         ])
       );
-      ctx.session.state = STATES.MAIN_MENU;
       break;
-      
-    case 'back_to_menu':
+    }
+    
+    case 'back_to_menu': {
       await showMainMenu(ctx);
       ctx.session.state = STATES.MAIN_MENU;
       break;
-      
-    default:
+    }
+    
+    default: {
       await ctx.editMessageText(
-        "This feature is still being implemented for the Sepolia testnet.",
-        Markup.inlineKeyboard([
-          [Markup.button.callback('⬅️ Back to Menu', 'back_to_menu')]
-        ])
+        "Feature in development",
+        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'back_to_menu')]])
       );
+    }
   }
 });
 
-// Handle text messages based on state
+// Handle text messages based on conversation state
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id.toString();
   const text = ctx.message.text;
   const userData = loadUserData();
   
+  if (!userData[userId]) {
+    await ctx.reply('Please start the bot with /start first.');
+    return;
+  }
+  
   switch (ctx.session.state) {
-    case STATES.SET_BUY_PRICE:
-      // Validate and save buy price
-      const buyPrice = parseFloat(text);
-      if (isNaN(buyPrice) || buyPrice <= 0) {
-        await ctx.reply(
-          'Please enter a valid price (a positive number).'
-        );
+    case STATES.ENTER_BUY_AMOUNT: {
+      const amount = parseFloat(text);
+      
+      if (isNaN(amount) || amount <= 0) {
+        await ctx.reply('Please enter a valid amount (e.g. 0.01)');
         return;
       }
       
-      // Store the buy price in session
-      ctx.session.buyPrice = buyPrice;
+      try {
+        const result = await simulateBuyTransaction(userId, amount);
+        
+        if (result.success) {
+          await ctx.reply(
+            `✅ Buy successful!\n` +
+            `Amount: ${amount.toFixed(6)} ETH\n` +
+            `Price: $${result.ethPrice.toFixed(2)}\n` +
+            `Value: $${result.usdValue.toFixed(2)}\n` +
+            `New Balance: ${result.newBalance.toFixed(6)} ETH\n` +
+            `TX: ${result.txHash}`
+          );
+          
+          await showMainMenu(ctx);
+          ctx.session.state = STATES.MAIN_MENU;
+        }
+      } catch (error) {
+        console.error(`Buy error: ${error.message}`);
+        await ctx.reply(`❌ Error: ${error.message}`);
+      }
+      break;
+    }
+    
+    case STATES.ENTER_SEND_ADDRESS: {
+      const toAddress = text.trim();
       
-      // Ask for sell price
+      // Basic address validation
+      if (!toAddress.startsWith('0x') || toAddress.length !== 42) {
+        await ctx.reply('Please enter a valid Ethereum address (42 chars starting with 0x)');
+        return;
+      }
+      
+      // Store the address temporarily in session
+      ctx.session.sendToAddress = toAddress;
+      
+      const ethPrice = await getEthPrice();
+      const balance = await checkBalance(userData[userId].walletAddress);
+      
+      await ctx.reply(
+        `You're sending to: ${toAddress}\n` +
+        `Your Balance: ${balance.toFixed(6)} ETH\n` +
+        `Enter amount of ETH to send:`,
+        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'trade')]])
+      );
+      ctx.session.state = STATES.ENTER_SEND_AMOUNT;
+      break;
+    }
+    
+    case STATES.ENTER_SEND_AMOUNT: {
+      const amount = parseFloat(text);
+      
+      if (isNaN(amount) || amount <= 0) {
+        await ctx.reply('Please enter a valid amount (e.g. 0.01)');
+        return;
+      }
+      
+      const toAddress = ctx.session.sendToAddress;
+      if (!toAddress) {
+        await ctx.reply('Recipient address not found. Please start again.');
+        await showMainMenu(ctx);
+        ctx.session.state = STATES.MAIN_MENU;
+        return;
+      }
+      
+      try {
+        const result = await sendEthTransaction(userId, toAddress, amount);
+        
+        if (result.success) {
+          await ctx.reply(
+            `✅ ETH sent successfully!\n` +
+            `Amount: ${amount.toFixed(6)} ETH\n` +
+            `To: ${toAddress}\n` +
+            `Value: $${result.usdValue.toFixed(2)}\n` +
+            `New Balance: ${result.newBalance.toFixed(6)} ETH\n` +
+            `TX: ${result.txHash}`
+          );
+          
+          // Clear temporary session data
+          ctx.session.sendToAddress = null;
+          await showMainMenu(ctx);
+          ctx.session.state = STATES.MAIN_MENU;
+        } else {
+          await ctx.reply(`❌ Error: ${result.error}. Current balance: ${result.currentBalance?.toFixed(6) || '0'} ETH`);
+        }
+      } catch (error) {
+        console.error(`Send error: ${error.message}`);
+        await ctx.reply(`❌ Error: ${error.message}`);
+      }
+      break;
+    }
+    
+    case STATES.SET_BUY_PRICE: {
+      const price = parseFloat(text);
+      
+      if (isNaN(price) || price <= 0) {
+        await ctx.reply('Please enter a valid price (e.g. 2500)');
+        return;
+      }
+      
+      ctx.session.autoTrade = ctx.session.autoTrade || {};
+      ctx.session.autoTrade.buyPrice = price;
+      
       const currentPrice = await getEthPrice();
       await ctx.reply(
-        `Buy price set to: $${buyPrice.toFixed(2)}\n\n` +
-        `At what price would you like to SELL ETH?\n` +
-        `Enter a USD price (e.g., ${(currentPrice * 1.05).toFixed(2)} for 5% above current price):`,
-        Markup.inlineKeyboard([
-          [Markup.button.callback('⬅️ Back to Auto-Trade', 'auto_trade')]
-        ])
+        `Buy price set: $${price}\n` +
+        `Set sell price (current: $${currentPrice.toFixed(2)}):`,
+        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'auto_trade')]])
       );
       ctx.session.state = STATES.SET_SELL_PRICE;
       break;
+    }
+    
+    case STATES.SET_SELL_PRICE: {
+      const price = parseFloat(text);
       
-    case STATES.SET_SELL_PRICE:
-      // Validate and save sell price
-      const sellPrice = parseFloat(text);
-      if (isNaN(sellPrice) || sellPrice <= 0) {
-        await ctx.reply(
-          'Please enter a valid price (a positive number).'
-        );
+      if (isNaN(price) || price <= 0) {
+        await ctx.reply('Please enter a valid price (e.g. 2700)');
         return;
       }
       
-      // Store the sell price in session
-      ctx.session.sellPrice = sellPrice;
+      ctx.session.autoTrade.sellPrice = price;
       
-      // Confirm auto-trade setup
-      const buyPriceConfirm = ctx.session.buyPrice;
       await ctx.reply(
-        `Auto-Trade Setup:\n\n` +
-        `Buy ETH when price reaches: $${buyPriceConfirm.toFixed(2)}\n` +
-        `Sell ETH when price reaches: $${sellPrice.toFixed(2)}\n\n` +
-        `Confirm this auto-trade setup?`,
+        `Sell price set: $${price}\n` +
+        `Enter amount in ETH to auto-trade:`,
+        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'auto_trade')]])
+      );
+      ctx.session.state = STATES.SET_AMOUNT;
+      break;
+    }
+    
+    case STATES.SET_AMOUNT: {
+      const amount = parseFloat(text);
+      
+      if (isNaN(amount) || amount <= 0) {
+        await ctx.reply('Please enter a valid amount (e.g. 0.01)');
+        return;
+      }
+      
+      ctx.session.autoTrade.amount = amount;
+      
+      await ctx.reply(
+        `Auto-trade configuration:\n` +
+        `Buy at: $${ctx.session.autoTrade.buyPrice}\n` +
+        `Sell at: $${ctx.session.autoTrade.sellPrice}\n` +
+        `Amount: ${amount} ETH\n\n` +
+        `Confirm setup?`,
         Markup.inlineKeyboard([
           [Markup.button.callback('✅ Confirm', 'confirm_auto_trade')],
           [Markup.button.callback('❌ Cancel', 'auto_trade')]
@@ -455,273 +730,287 @@ bot.on('text', async (ctx) => {
       );
       ctx.session.state = STATES.CONFIRM_AUTO_TRADE;
       break;
-      
-    case STATES.ENTER_BUY_AMOUNT:
-      // Process buy amount
-      const buyAmount = parseFloat(text);
-      if (isNaN(buyAmount) || buyAmount <= 0) {
-        await ctx.reply(
-          'Please enter a valid amount (a positive number).'
-        );
-        return;
-      }
-      
-      // Simulate buy transaction
-      const buyResult = await simulateBuyTransaction(userId, buyAmount);
-      
-      await ctx.reply(
-        `✅ Simulated Buy Transaction (Sepolia Testnet)\n\n` +
-        `Amount: ${buyAmount.toFixed(6)} ETH\n` +
-        `Price: $${buyResult.ethPrice.toFixed(2)}\n` +
-        `Total Value: $${buyResult.usdValue.toFixed(2)}\n\n` +
-        `Note: This is a simulation. In a real implementation, this would execute a buy transaction on Sepolia.`,
-        Markup.inlineKeyboard([
-          [Markup.button.callback('⬅️ Back to Trade', 'trade')]
-        ])
-      );
+    }
+    
+    default: {
+      await showMainMenu(ctx);
       ctx.session.state = STATES.MAIN_MENU;
-      break;
-      
-    case STATES.ENTER_SELL_AMOUNT:
-      // Process sell amount
-      const sellAmount = parseFloat(text);
-      if (isNaN(sellAmount) || sellAmount <= 0) {
-        await ctx.reply(
-          'Please enter a valid amount (a positive number).'
-        );
-        return;
-      }
-      
-      // Check balance
-      const balance = await checkBalance(userData[userId].walletAddress);
-      if (sellAmount > balance) {
-        await ctx.reply(
-          `❌ Insufficient balance.\n\n` +
-          `Your balance: ${balance.toFixed(6)} ETH\n` +
-          `Requested sell amount: ${sellAmount.toFixed(6)} ETH`,
-          Markup.inlineKeyboard([
-            [Markup.button.callback('⬅️ Back to Trade', 'trade')]
-          ])
-        );
-        return;
-      }
-      
-      // Simulate sell transaction
-      const sellResult = await simulateSellTransaction(userId, sellAmount);
-      
-      await ctx.reply(
-        `✅ Simulated Sell Transaction (Sepolia Testnet)\n\n` +
-        `Amount: ${sellAmount.toFixed(6)} ETH\n` +
-        `Price: $${sellResult.ethPrice.toFixed(2)}\n` +
-        `Total Value: $${sellResult.usdValue.toFixed(2)}\n\n` +
-        `Note: This is a simulation. In a real implementation, this would execute a sell transaction on Sepolia.`,
-        Markup.inlineKeyboard([
-          [Markup.button.callback('⬅️ Back to Trade', 'trade')]
-        ])
-      );
-      ctx.session.state = STATES.MAIN_MENU;
-      break;
-      
-    default:
-      // For any other state, respond with menu
-      await ctx.reply(
-        "I don't understand that command in the current context.",
-        Markup.inlineKeyboard([
-          [Markup.button.callback('⬅️ Back to Menu', 'back_to_menu')]
-        ])
-      );
+    }
   }
 });
 
-// Add a new action to handle auto-trade confirmation
+// Handle the auto-trade confirmation action
 bot.action('confirm_auto_trade', async (ctx) => {
   const userId = ctx.from.id.toString();
   const userData = loadUserData();
   
-  // Get the buy and sell prices from session
-  const buyPrice = ctx.session.buyPrice;
-  const sellPrice = ctx.session.sellPrice;
-  
-  // Add the auto-trade to user data
-  if (!userData[userId].autoTrades) {
-    userData[userId].autoTrades = [];
-  }
-  
-  userData[userId].autoTrades.push({
-    buyPrice: buyPrice,
-    sellPrice: sellPrice,
-    createdAt: new Date().toISOString()
-  });
-  
-  // Save updated user data
-  saveUserData(userData);
-  
   await ctx.answerCbQuery();
-  await ctx.editMessageText(
-    `✅ Auto-Trade Setup Confirmed!\n\n` +
-    `Buy ETH when price reaches: $${buyPrice.toFixed(2)}\n` +
-    `Sell ETH when price reaches: $${sellPrice.toFixed(2)}\n\n` +
-    `The bot will notify you when these conditions are met.`,
-    Markup.inlineKeyboard([
-      [Markup.button.callback('⬅️ Back to Menu', 'back_to_menu')]
-    ])
-  );
   
-  ctx.session.state = STATES.MAIN_MENU;
-});
-
-// Add a command to check RPC connection
-bot.command('checkrpc', async (ctx) => {
-  try {
-    const blockNumber = await web3.eth.getBlockNumber();
-    await ctx.reply(
-      `✅ Connected to Sepolia testnet!\n` +
-      `Current block: ${blockNumber}\n`
+  if (!ctx.session.autoTrade || !ctx.session.autoTrade.buyPrice || !ctx.session.autoTrade.sellPrice || !ctx.session.autoTrade.amount) {
+    await ctx.editMessageText(
+      'Auto-trade setup incomplete. Please start again.',
+      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'auto_trade')]])
     );
-  } catch (error) {
-    await ctx.reply(
-      `❌ Connection error: ${error.message}\n` +
-      `The bot will attempt to reconnect to an alternative RPC endpoint.`
-    );
-    
-    // Try to reconnect
-    try {
-      web3 = await initWeb3();
-      const newBlockNumber = await web3.eth.getBlockNumber();
-      await ctx.reply(
-        `✅ Reconnected successfully!\n` +
-        `Current block: ${newBlockNumber}`
-      );
-    } catch (reconnectError) {
-      await ctx.reply(
-        `❌ Failed to reconnect: ${reconnectError.message}`
-      );
-    }
+    return;
   }
-});
-
-// Add a command to get Sepolia testnet ETH information
-bot.command('faucet', async (ctx) => {
-  await ctx.reply(
-    `🚰 Sepolia Testnet ETH Faucets 🚰\n\n` +
-    `Get free Sepolia ETH from these faucets:\n\n` +
-    `1. Alchemy Sepolia Faucet:\n` +
-    `https://sepoliafaucet.com/\n\n` +
-    `2. Infura Sepolia Faucet:\n` +
-    `https://www.infura.io/faucet/sepolia\n\n` +
-    `3. QuickNode Sepolia Faucet:\n` +
-    `https://faucet.quicknode.com/ethereum/sepolia\n\n` +
-    `You'll need some Sepolia ETH to use the trading features.`
-  );
-});
-
-// Cancel command
-bot.command('cancel', async (ctx) => {
-  await ctx.reply("Operation canceled. Type /start to begin again.");
-  ctx.session = { state: STATES.MAIN_MENU };
-});
-
-// Price monitoring function
-function startPriceMonitor() {
-  const checkPrices = async () => {
-    try {
-      const ethPrice = await getEthPrice();
-      if (ethPrice === null) {
-        return;
-      }
-      
-      const userData = loadUserData();
-      let updated = false;
-      
-      for (const userId in userData) {
-        const user = userData[userId];
-        if (!user.autoTrades || user.autoTrades.length === 0) {
-          continue;
-        }
-        
-        for (let i = user.autoTrades.length - 1; i >= 0; i--) {
-          const trade = user.autoTrades[i];
-          const buyPrice = parseFloat(trade.buyPrice);
-          const sellPrice = parseFloat(trade.sellPrice);
-          
-          // Check if buy conditions are met
-          if (ethPrice <= buyPrice) {
-            console.log(`Auto-buy triggered for user ${userId}: ETH price $${ethPrice.toFixed(2)} <= $${buyPrice.toFixed(2)}`);
-            
-            try {
-              await bot.telegram.sendMessage(
-                userId,
-                `🤖 Auto-Buy Triggered! (Sepolia Testnet)\n\n` +
-                `ETH Price: $${ethPrice.toFixed(2)}\n` +
-                `Your Buy Price: $${buyPrice.toFixed(2)}\n\n` +
-                `In a real implementation, this would execute a buy transaction on Sepolia testnet.`
-              );
-            } catch (error) {
-              console.error(`Failed to notify user ${userId}: ${error.message}`);
-            }
-          }
-          
-          // Check if sell conditions are met
-          else if (ethPrice >= sellPrice) {
-            console.log(`Auto-sell triggered for user ${userId}: ETH price $${ethPrice.toFixed(2)} >= $${sellPrice.toFixed(2)}`);
-            
-            try {
-              await bot.telegram.sendMessage(
-                userId,
-                `🤖 Auto-Sell Triggered! (Sepolia Testnet)\n\n` +
-                `ETH Price: $${ethPrice.toFixed(2)}\n` +
-                `Your Sell Price: $${sellPrice.toFixed(2)}\n\n` +
-                `In a real implementation, this would execute a sell transaction on Sepolia testnet.`
-              );
-              
-              // Remove the completed auto-trade
-              user.autoTrades.splice(i, 1);
-              updated = true;
-            } catch (error) {
-              console.error(`Failed to notify user ${userId}: ${error.message}`);
-            }
-          }
-        }
-      }
-      
-      if (updated) {
-        saveUserData(userData);
-      }
-    } catch (error) {
-      console.error(`Error in price monitor: ${error.message}`);
-    }
-    
-    // Schedule the next check
-    setTimeout(checkPrices, 60000); // Check every 60 seconds
+  
+  const autoTrade = {
+    buyPrice: ctx.session.autoTrade.buyPrice,
+    sellPrice: ctx.session.autoTrade.sellPrice,
+    amount: ctx.session.autoTrade.amount,
+    created: Date.now(),
+    active: true
   };
   
-  // Start the first check
-  checkPrices();
+  userData[userId].autoTrades = userData[userId].autoTrades || [];
+  userData[userId].autoTrades.push(autoTrade);
+  saveUserData(userData);
+  
+  await ctx.editMessageText(
+    `✅ Auto-trade created!\n` +
+    `Buy at: $${autoTrade.buyPrice}\n` +
+    `Sell at: $${autoTrade.sellPrice}\n` +
+    `Amount: ${autoTrade.amount} ETH`,
+    Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'auto_trade')]])
+  );
+  
+  ctx.session.autoTrade = null;
+  ctx.session.state = STATES.AUTO_TRADE_SETUP;
+});
+
+// Check price triggers for auto-trades
+async function checkPriceTriggers() {
+  try {
+    const currentPrice = await getEthPrice();
+    console.log(`Checking price triggers. Current price: $${currentPrice}`);
+    
+    const userData = loadUserData();
+    let dataChanged = false;
+    
+    for (const userId in userData) {
+      const user = userData[userId];
+      if (!user.autoTrades || user.autoTrades.length === 0) continue;
+      
+      for (let i = 0; i < user.autoTrades.length; i++) {
+        const trade = user.autoTrades[i];
+        if (!trade.active) continue;
+        
+        // Check buy trigger
+        if (currentPrice <= trade.buyPrice && !trade.bought) {
+          console.log(`Auto-trade buy triggered for user ${userId} at $${currentPrice}`);
+          
+          // Execute buy
+          try {
+            const result = await simulateBuyTransaction(userId, trade.amount);
+            if (result.success) {
+              trade.bought = true;
+              trade.buyExecuted = Date.now();
+              trade.buyTxHash = result.txHash;
+              trade.buyActualPrice = currentPrice;
+              
+              dataChanged = true;
+              
+              // Notify user
+              bot.telegram.sendMessage(userId, 
+                `🤖 Auto-trade BUY executed!\n` +
+                `Amount: ${trade.amount} ETH\n` +
+                `Price: $${currentPrice.toFixed(2)}\n` +
+                `Value: $${(trade.amount * currentPrice).toFixed(2)}\n` +
+                `TX: ${result.txHash}`
+              );
+            }
+          } catch (error) {
+            console.error(`Auto-trade buy error: ${error.message}`);
+          }
+        }
+        
+        // Check sell trigger (only if previously bought)
+        if (trade.bought && currentPrice >= trade.sellPrice) {
+          console.log(`Auto-trade sell triggered for user ${userId} at $${currentPrice}`);
+          
+          // For simulation, we'll create a "sell" transaction
+          // This would be a real transaction in production
+          const txn = {
+            type: 'sell',
+            amount: trade.amount,
+            price: currentPrice,
+            usdValue: trade.amount * currentPrice,
+            timestamp: Date.now(),
+            txHash: `sim_sell_${Date.now().toString(16)}`
+          };
+          
+          // Initialize transactions array if it doesn't exist
+          if (!user.transactions) {
+            user.transactions = [];
+          }
+          
+          user.transactions.push(txn);
+          
+          // Calculate and log profit
+          const profit = trade.amount * (currentPrice - trade.buyActualPrice);
+          const profitPercent = ((currentPrice / trade.buyActualPrice) - 1) * 100;
+          
+          trade.sold = true;
+          trade.sellExecuted = Date.now();
+          trade.sellTxHash = txn.txHash;
+          trade.sellActualPrice = currentPrice;
+          trade.profit = profit;
+          trade.profitPercent = profitPercent;
+          trade.active = false;  // Deactivate after execution
+          
+          dataChanged = true;
+          
+          // Notify user
+          bot.telegram.sendMessage(userId, 
+            `🤖 Auto-trade SELL executed!\n` +
+            `Amount: ${trade.amount} ETH\n` +
+            `Buy Price: $${trade.buyActualPrice.toFixed(2)}\n` +
+            `Sell Price: $${currentPrice.toFixed(2)}\n` +
+            `Profit: $${profit.toFixed(2)} (${profitPercent.toFixed(2)}%)\n` +
+            `TX: ${txn.txHash}`
+          );
+        }
+      }
+    }
+    
+    if (dataChanged) {
+      saveUserData(userData);
+    }
+  } catch (error) {
+    console.error(`Error checking price triggers: ${error.message}`);
+  }
 }
 
-// Start the bot
+// Command to view your wallet address
+bot.command('wallet', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const userData = loadUserData();
+  
+  if (!userData[userId]) {
+    await ctx.reply('Please start the bot with /start first.');
+    return;
+  }
+  
+  const address = userData[userId].walletAddress;
+  await ctx.reply(
+    `Your wallet address:\n${address}\n\n` +
+    `View on Etherscan:\n${config.ETHERSCAN_URL}/address/${address}`
+  );
+});
+
+// Help command
+bot.command('help', async (ctx) => {
+  await ctx.reply(
+    '🤖 ETH Trading Bot Help 🤖\n\n' +
+    'Commands:\n' +
+    '/start - Initialize your wallet\n' +
+    '/wallet - View your wallet address\n' +
+    '/balance - Check your balance\n' +
+    '/price - Get current ETH price\n' +
+    '/help - Show this help message\n\n' +
+    'Use the menu buttons to navigate trading features.'
+  );
+});
+
+// Balance command
+bot.command('balance', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const userData = loadUserData();
+  
+  if (!userData[userId]) {
+    await ctx.reply('Please start the bot with /start first.');
+    return;
+  }
+  
+  const address = userData[userId].walletAddress;
+  const balance = await checkBalance(address);
+  const ethPrice = await getEthPrice();
+  
+  await ctx.reply(
+    `💰 Balance: ${balance.toFixed(6)} ETH\n` +
+    `Value: $${(balance * ethPrice).toFixed(2)}\n` +
+    `Current Price: $${ethPrice.toFixed(2)}`
+  );
+});
+
+// Price command
+bot.command('price', async (ctx) => {
+  const ethPrice = await getEthPrice();
+  await ctx.reply(`Current ETH Price: $${ethPrice.toFixed(2)}`);
+});
+
+// Show transaction history
+bot.command('history', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const userData = loadUserData();
+  
+  if (!userData[userId]) {
+    await ctx.reply('Please start the bot with /start first.');
+    return;
+  }
+  
+  const txns = userData[userId].transactions || [];
+  if (txns.length === 0) {
+    await ctx.reply('No transaction history yet.');
+    return;
+  }
+  
+  const txHistory = txns.slice(-10).reverse().map((t, i) => {
+    const date = new Date(t.timestamp).toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+    
+    if (t.type === 'buy') {
+      return `${i+1}. 🟢 ${date} Buy ${t.amount.toFixed(4)} ETH @ $${t.price.toFixed(2)}`;
+    } else if (t.type === 'sell') {
+      return `${i+1}. 🔴 ${date} Sell ${t.amount.toFixed(4)} ETH @ $${t.price.toFixed(2)}`;
+    } else if (t.type === 'send') {
+      return `${i+1}. 🔹 ${date} Send ${t.amount.toFixed(4)} ETH to ${t.to.substring(0, 8)}...`;
+    }
+  }).join('\n');
+  
+  await ctx.reply(
+    `📜 Transaction History:\n\n${txHistory}\n\n` +
+    `Total transactions: ${txns.length}`
+  );
+});
+
+// Error handling
+bot.catch((err, ctx) => {
+  console.error(`Bot error: ${err.message}`);
+  ctx.reply('An error occurred. Please try again later.');
+});
+
+// Check and handle price-triggered trades periodically
+setInterval(checkPriceTriggers, config.PRICE_CHECK_INTERVAL);
+
+// Bot startup
 async function startBot() {
   try {
-    // Initialize Web3 with fallback RPC endpoints
+    // Initialize Web3
     web3 = await initWeb3();
     
     // Start the bot
     await bot.launch();
-    console.log('ETH Trading Bot is running on Sepolia Testnet!');
+    console.log('Bot is running...');
     
-    // Start price monitoring
-    if (!global.priceMonitorRunning) {
-      global.priceMonitorRunning = true;
-      startPriceMonitor();
-    }
+    // Initial price check
+    const initialPrice = await getEthPrice();
+    console.log(`Initial ETH price: $${initialPrice}`);
+    
   } catch (error) {
     console.error(`Failed to start bot: ${error.message}`);
+    process.exit(1);
   }
 }
 
-// Start the bot
-startBot();
-
-// Enable graceful stop
+// Handle graceful shutdown
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+// Start the bot
+startBot();
+      

@@ -2,7 +2,35 @@
   "2115764469": {
     "walletAddress": "0xB478FDA3A022A9b25ea0f02544bd5657f9181051",
     "privateKey": "0x1824c2b7159591b10385035b35b02ddcd6a941bc54c26f89bf930aaddc13ebee",
-    "balance": "0",
-    "autoTrades": []
+    "balance": "1.009936965335867",
+    "autoTrades": [],
+    "transactions": [
+      {
+        "type": "sell",
+        "amount": 0.05,
+        "price": 2497.37,
+        "usdValue": 124.8685,
+        "timestamp": 1747029464999,
+        "txHash": "sim_sell_196c31217a7"
+      },
+      {
+        "type": "send",
+        "amount": 0.05,
+        "to": "0xb9D2983CCFd216d0d5A547685579f4E5cF12a3e1",
+        "price": 2563.52,
+        "usdValue": 128.17600000000002,
+        "timestamp": 1747034564770,
+        "txHash": "sim_send_196c35fe8a2"
+      },
+      {
+        "type": "send",
+        "amount": 0.02,
+        "to": "0xb9D2983CCFd216d0d5A547685579f4E5cF12a3e1",
+        "price": 2579.3,
+        "usdValue": 51.586000000000006,
+        "timestamp": 1747035046949,
+        "txHash": "sim_send_196c3674425"
+      }
+    ]
   }
 }
